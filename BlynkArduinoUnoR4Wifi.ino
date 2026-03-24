@@ -64,7 +64,7 @@ void myTimerEvent()
 void setup()
 {
   // Debug console
-  Serial.begin(115200);
+  Serial.begin(9600);
 
   Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
   // You can also specify server:
