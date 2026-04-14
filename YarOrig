@@ -1,14 +1,3 @@
-/*
- * =====================================================
- *  Servo Control via Blynk — Arduino UNO R4 WiFi
- * =====================================================
- *  V0  — Button  (press to rotate)
- *  V1  — Time Input (schedule 1)
- *  V2  — Time Input (schedule 2)
- *  V3  — Time Input (schedule 3)
- * =====================================================
- */
-
 #define BLYNK_TEMPLATE_ID   "TMPLLfq86kcK"
 #define BLYNK_TEMPLATE_NAME "Quickstart Template"
 #define BLYNK_AUTH_TOKEN    "gQUGZ-WRSsEYRXBKjV8ci5QMpPwp1WiY"
@@ -18,17 +7,43 @@
 #include <BlynkSimpleWifi.h>
 #include <Servo.h>
 #include <TimeLib.h>
+#include "Ultrasonic.h"
+#include "rgb_lcd.h"
 
+// WiFi
 char ssid[] = "IoTtest";
 char pass[] = "IoTtestTeamA";
 
+// Hardware
 Servo myServo;
-const int SERVO_PIN    = 5;
-const int SERVO_OPEN   = 90;
+Ultrasonic ultrasonic(7);
+rgb_lcd lcd;
+
+const int SERVO_PIN = 5;
+const int buttonPin = 6;
+
+// Calibration
+const int EMPTY_DISTANCE = 30;
+const int FULL_DISTANCE  = 5;
+
+// Servo
 const int SERVO_CLOSED = 0;
 
-bool buttonActive = false;
+// LCD
+const int colorR = 255;
+const int colorG = 0;
+const int colorB = 0;
 
+// States
+bool buttonActive = false;
+unsigned long lastScheduleFeedTime = 0;
+
+// ───── НЕБЛОКИРУЮЩИЙ SERVO ─────
+bool feeding = false;
+int servoPos = 0;
+bool servoForward = true;
+
+// Time slots
 struct TimeSlot {
   int startHour = -1, startMinute = -1;
   int stopHour  = -1, stopMinute  = -1;
@@ -38,38 +53,148 @@ TimeSlot slots[3];
 
 BlynkTimer timer;
 
-// ── Time utilities ────────────────────────────────────────────────────────────
+// ───────── WIFI ─────────
+void connectWiFi() {
+  Serial.println("[WiFi] Connecting...");
+  lcd.clear();
+  lcd.print("WiFi connecting");
+
+  int attempt = 0;
+
+  WiFi.begin(ssid, pass);
+
+  while (WiFi.status() != WL_CONNECTED && attempt < 40) {
+    delay(500);
+    Serial.print(".");
+    attempt++;
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("[WiFi] Connected!");
+    Serial.println(WiFi.localIP());
+    lcd.clear();
+    lcd.print("WiFi OK");
+  } else {
+    Serial.println("[WiFi] Failed!");
+    lcd.clear();
+    lcd.print("WiFi FAIL");
+  }
+
+  delay(1000);
+}
+
+// ───────── FOOD ─────────
+int getFoodLevel() {
+  long dist = ultrasonic.MeasureInCentimeters();
+  if (dist <= 0) return -1;
+
+  dist = constrain(dist, FULL_DISTANCE, EMPTY_DISTANCE);
+  return map(dist, EMPTY_DISTANCE, FULL_DISTANCE, 0, 100);
+}
+
+// ───────── DISPLAY ─────────
+void updateDisplay() {
+  long dist = ultrasonic.MeasureInCentimeters();
+
+  lcd.setCursor(0, 0);
+  lcd.print("D:");
+  lcd.print(dist);
+  lcd.print("cm ");
+
+  int level = getFoodLevel();
+
+  lcd.print("F:");
+  lcd.print(level);
+  lcd.print("% ");
+}
+
+// ───────── TIME ─────────
+void updateTimeDisplay() {
+  char buf[9];
+  sprintf(buf, "%02d:%02d:%02d", hour(), minute(), second());
+
+  lcd.setCursor(0, 1);
+  lcd.print("Time:");
+  lcd.print(buf);
+
+  Serial.print("[TIME] ");
+  Serial.println(buf);
+}
+
+// ───────── SERVO ─────────
+void handleServo() {
+  if (!feeding) return;
+
+  myServo.write(servoPos);
+
+  if (servoForward) {
+    servoPos++;
+    if (servoPos >= 180) servoForward = false;
+  } else {
+    servoPos--;
+    if (servoPos <= 0) {
+      feeding = false;
+      lcd.clear();
+    }
+  }
+}
+
+// ───────── FEED ─────────
+void feedCat() {
+  if (feeding) return;
+
+  feeding = true;
+  servoPos = 0;
+  servoForward = true;
+
+  lcd.clear();
+  lcd.print("Feeding...");
+}
+
+// ───────── CHECK FEED ─────────
 int toMinutes(int h, int m) { return h * 60 + m; }
-int nowMinutes()            { return hour() * 60 + minute(); }
+int nowMinutes() { return hour() * 60 + minute(); }
 
 bool slotActive(const TimeSlot& s) {
   if (!s.enabled || s.startHour < 0) return false;
+
   int now = nowMinutes();
   int st  = toMinutes(s.startHour, s.startMinute);
-  int en  = toMinutes(s.stopHour,  s.stopMinute);
+  int en  = toMinutes(s.stopHour, s.stopMinute);
+
   if (st <= en) return (now >= st && now < en);
   return (now >= st || now < en);
 }
 
-// ── Servo ─────────────────────────────────────────────────────────────────────
-void updateServo() {
+void checkFeeding() {
   bool sched = slotActive(slots[0]) || slotActive(slots[1]) || slotActive(slots[2]);
-  myServo.write(buttonActive || sched ? SERVO_OPEN : SERVO_CLOSED);
-}
 
-// ── Print time every second (only after RTC sync) ────────────────────────────
-void printTime() {
-  if (timeStatus() != timeSet) {
-    Serial.println("[TIME] Waiting for RTC sync...");
-    return;
+  if (sched) {
+    if (millis() - lastScheduleFeedTime >= 60000) {
+      feedCat();
+      lastScheduleFeedTime = millis();
+    }
   }
-  char buf[32];
-  snprintf(buf, sizeof(buf), "[TIME] %02d:%02d:%02d", hour(), minute(), second());
-  Serial.println(buf);
+
+  if (buttonActive) {
+    feedCat();        // логика не изменена
+    buttonActive = false;
+  }
 }
 
-// ── Blynk callbacks ───────────────────────────────────────────────────────────
-BLYNK_WRITE(V0) { buttonActive = (param.asInt() == 1); updateServo(); }
+// ───────── BUTTON ─────────
+void checkButton() {
+  if (digitalRead(buttonPin) == LOW) {
+    feedCat();        // логика не изменена
+  }
+}
+
+// ───────── BLYNK ─────────
+BLYNK_WRITE(V0) {
+  buttonActive = (param.asInt() == 1);
+}
 
 #define PARSE_SLOT(V, idx) BLYNK_WRITE(V) { \
   long s = param[0].asLong(), e = param[1].asLong(); \
@@ -79,7 +204,9 @@ BLYNK_WRITE(V0) { buttonActive = (param.asInt() == 1); updateServo(); }
     slots[idx].stopHour    = e / 3600; \
     slots[idx].stopMinute  = (e % 3600) / 60; \
     slots[idx].enabled = true; \
-  } else { slots[idx].enabled = false; } \
+  } else { \
+    slots[idx].enabled = false; \
+  } \
 }
 
 PARSE_SLOT(V1, 0)
@@ -87,112 +214,55 @@ PARSE_SLOT(V2, 1)
 PARSE_SLOT(V3, 2)
 
 BLYNK_CONNECTED() {
-  Serial.println("[BLYNK] Connected to Blynk server!");
+  Serial.println("[BLYNK] Connected!");
   Blynk.syncAll();
   Blynk.sendInternal("rtc", "sync");
 }
 
 BLYNK_DISCONNECTED() {
-  Serial.println("[BLYNK] Disconnected from Blynk server.");
+  Serial.println("[BLYNK] Disconnected!");
 }
 
 BLYNK_WRITE(InternalPinRTC) {
   setTime(param.asLong());
-  Serial.println("[RTC] Time synchronized.");
+  Serial.println("[RTC] Time sync");
 }
 
-// ── WiFi connection with full diagnostics ─────────────────────────────────────
-void connectWiFi() {
-  Serial.print("[WiFi] Connecting to: ");
-  Serial.println(ssid);
-
-  // Scan networks first
-  Serial.println("[WiFi] Scanning networks...");
-  int n = WiFi.scanNetworks();
-  if (n == 0) {
-    Serial.println("[WiFi] WARNING: No networks found! Check hotspot.");
-  } else {
-    Serial.print("[WiFi] Found ");
-    Serial.print(n);
-    Serial.println(" network(s):");
-    bool found = false;
-    for (int i = 0; i < n; i++) {
-      Serial.print("  > ");
-      Serial.print(WiFi.SSID(i));
-      Serial.print("  (RSSI: ");
-      Serial.print(WiFi.RSSI(i));
-      Serial.println(" dBm)");
-      if (String(WiFi.SSID(i)) == String(ssid)) found = true;
-    }
-    if (found) {
-      Serial.println("[WiFi] Target network FOUND.");
-    } else {
-      Serial.println("[WiFi] WARNING: Target network NOT found in scan!");
-      Serial.println("[WiFi] Check: hotspot name, 2.4GHz band enabled.");
-    }
-  }
-
-  // Connect
-  WiFi.begin(ssid, pass);
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
-    delay(500);
-    attempts++;
-    Serial.print(".");
-    if (attempts % 20 == 0) {
-      Serial.println();
-      Serial.println("[WiFi] Retrying...");
-      WiFi.end();
-      delay(1000);
-      WiFi.begin(ssid, pass);
-    }
-  }
-  Serial.println();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("[WiFi] Connected successfully!");
-    Serial.print("[WiFi] IP address : ");
-    Serial.println(WiFi.localIP());
-    Serial.print("[WiFi] Signal (RSSI): ");
-    Serial.print(WiFi.RSSI());
-    Serial.println(" dBm");
-  } else {
-    Serial.println("[WiFi] FAILED to connect.");
-    Serial.println("[WiFi] Check: SSID/password, hotspot ON, 2.4GHz band.");
-  }
-}
-
-// ── Setup ─────────────────────────────────────────────────────────────────────
+// ───────── SETUP ─────────
 void setup() {
   Serial.begin(115200);
-  delay(3000); // wait for Serial Monitor to open
 
-  Serial.println("========================================");
-  Serial.println("  Servo + Blynk  |  Arduino UNO R4 WiFi");
-  Serial.println("========================================");
+  lcd.begin(16, 2);
+  lcd.setRGB(colorR, colorG, colorB);
+  lcd.print("Starting...");
 
   myServo.attach(SERVO_PIN);
   myServo.write(SERVO_CLOSED);
-  Serial.println("[SERVO] Initialized on pin D5.");
+
+  pinMode(buttonPin, INPUT_PULLUP);
 
   connectWiFi();
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("[BLYNK] Connecting to Blynk server...");
+    Serial.println("[BLYNK] Connecting...");
     Blynk.config(BLYNK_AUTH_TOKEN);
     Blynk.connect(5000);
   }
 
-  timer.setInterval(30000L, updateServo); // check schedule every 30 sec
-  timer.setInterval(1000L,  printTime);   // print time every second
+  timer.setInterval(2000L, updateDisplay);
+  timer.setInterval(1000L, updateTimeDisplay);
+  timer.setInterval(20L,   handleServo);
+  timer.setInterval(500L,  checkButton);
+  timer.setInterval(10000L, checkFeeding);
 }
 
-// ── Loop ──────────────────────────────────────────────────────────────────────
+// ───────── LOOP ─────────
 void loop() {
-  // Auto-reconnect WiFi if dropped
+
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[WiFi] Connection lost. Reconnecting...");
+    Serial.println("[WiFi] Lost. Reconnecting...");
     connectWiFi();
+
     if (WiFi.status() == WL_CONNECTED) {
       Blynk.config(BLYNK_AUTH_TOKEN);
       Blynk.connect(5000);
