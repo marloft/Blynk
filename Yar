@@ -1,0 +1,274 @@
+#define BLYNK_TEMPLATE_ID   "TMPLLfq86kcK"
+#define BLYNK_TEMPLATE_NAME "Quickstart Template"
+#define BLYNK_AUTH_TOKEN    "gQUGZ-WRSsEYRXBKjV8ci5QMpPwp1WiY"
+#define BLYNK_PRINT Serial
+
+#include <WiFiS3.h>
+#include <BlynkSimpleWifi.h>
+#include <Servo.h>
+#include <TimeLib.h>
+#include "Ultrasonic.h"
+#include "rgb_lcd.h"
+
+// WiFi
+char ssid[] = "IoTtest";
+char pass[] = "IoTtestTeamA";
+
+// Hardware
+Servo myServo;
+Ultrasonic ultrasonic(7);
+rgb_lcd lcd;
+
+const int SERVO_PIN = 5;
+const int buttonPin = 6;
+
+// Calibration
+const int EMPTY_DISTANCE = 30;
+const int FULL_DISTANCE  = 5;
+
+// Servo
+const int SERVO_CLOSED = 0;
+
+// LCD
+const int colorR = 255;
+const int colorG = 0;
+const int colorB = 0;
+
+// States
+bool buttonActive = false;
+unsigned long lastScheduleFeedTime = 0;
+
+// ───── НЕБЛОКИРУЮЩИЙ SERVO ─────
+bool feeding = false;
+int servoPos = 0;
+bool servoForward = true;
+
+// Time slots
+struct TimeSlot {
+  int startHour = -1, startMinute = -1;
+  int stopHour  = -1, stopMinute  = -1;
+  bool enabled  = false;
+};
+TimeSlot slots[3];
+
+BlynkTimer timer;
+
+// ───────── WIFI ─────────
+void connectWiFi() {
+  Serial.println("[WiFi] Connecting...");
+  lcd.clear();
+  lcd.print("WiFi connecting");
+
+  int attempt = 0;
+
+  WiFi.begin(ssid, pass);
+
+  while (WiFi.status() != WL_CONNECTED && attempt < 40) {
+    delay(500);
+    Serial.print(".");
+    attempt++;
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("[WiFi] Connected!");
+    Serial.println(WiFi.localIP());
+    lcd.clear();
+    lcd.print("WiFi OK");
+  } else {
+    Serial.println("[WiFi] Failed!");
+    lcd.clear();
+    lcd.print("WiFi FAIL");
+  }
+
+  delay(1000);
+}
+
+// ───────── FOOD ─────────
+int getFoodLevel() {
+  long dist = ultrasonic.MeasureInCentimeters();
+  if (dist <= 0) return -1;
+
+  dist = constrain(dist, FULL_DISTANCE, EMPTY_DISTANCE);
+  return map(dist, EMPTY_DISTANCE, FULL_DISTANCE, 0, 100);
+}
+
+// ───────── DISPLAY ─────────
+void updateDisplay() {
+  long dist = ultrasonic.MeasureInCentimeters();
+
+  lcd.setCursor(0, 0);
+  lcd.print("D:");
+  lcd.print(dist);
+  lcd.print("cm ");
+
+  int level = getFoodLevel();
+
+  lcd.print("F:");
+  lcd.print(level);
+  lcd.print("% ");
+}
+
+// ───────── TIME ─────────
+void updateTimeDisplay() {
+  char buf[9];
+  sprintf(buf, "%02d:%02d:%02d", hour(), minute(), second());
+
+  lcd.setCursor(0, 1);
+  lcd.print("Time:");
+  lcd.print(buf);
+
+  Serial.print("[TIME] ");
+  Serial.println(buf);
+}
+
+// ───────── SERVO ─────────
+void handleServo() {
+  if (!feeding) return;
+
+  myServo.write(servoPos);
+
+  if (servoForward) {
+    servoPos++;
+    if (servoPos >= 180) servoForward = false;
+  } else {
+    servoPos--;
+    if (servoPos <= 0) {
+      feeding = false;
+      lcd.clear();
+    }
+  }
+}
+
+// ───────── FEED ─────────
+void feedCat() {
+  if (feeding) return;
+
+  feeding = true;
+  servoPos = 0;
+  servoForward = true;
+
+  lcd.clear();
+  lcd.print("Feeding...");
+}
+
+// ───────── CHECK FEED ─────────
+int toMinutes(int h, int m) { return h * 60 + m; }
+int nowMinutes() { return hour() * 60 + minute(); }
+
+bool slotActive(const TimeSlot& s) {
+  if (!s.enabled || s.startHour < 0) return false;
+
+  int now = nowMinutes();
+  int st  = toMinutes(s.startHour, s.startMinute);
+  int en  = toMinutes(s.stopHour, s.stopMinute);
+
+  if (st <= en) return (now >= st && now < en);
+  return (now >= st || now < en);
+}
+
+void checkFeeding() {
+  bool sched = slotActive(slots[0]) || slotActive(slots[1]) || slotActive(slots[2]);
+
+  if (sched) {
+    if (millis() - lastScheduleFeedTime >= 60000) {
+      feedCat();
+      lastScheduleFeedTime = millis();
+    }
+  }
+
+  if (buttonActive) {
+    feedCat();        // логика не изменена
+    buttonActive = false;
+  }
+}
+
+// ───────── BUTTON ─────────
+void checkButton() {
+  if (digitalRead(buttonPin) == LOW) {
+    feedCat();        // логика не изменена
+  }
+}
+
+// ───────── BLYNK ─────────
+BLYNK_WRITE(V0) {
+  buttonActive = (param.asInt() == 1);
+}
+
+#define PARSE_SLOT(V, idx) BLYNK_WRITE(V) { \
+  long s = param[0].asLong(), e = param[1].asLong(); \
+  if (s >= 0 && e >= 0) { \
+    slots[idx].startHour   = s / 3600; \
+    slots[idx].startMinute = (s % 3600) / 60; \
+    slots[idx].stopHour    = e / 3600; \
+    slots[idx].stopMinute  = (e % 3600) / 60; \
+    slots[idx].enabled = true; \
+  } else { \
+    slots[idx].enabled = false; \
+  } \
+}
+
+PARSE_SLOT(V1, 0)
+PARSE_SLOT(V2, 1)
+PARSE_SLOT(V3, 2)
+
+BLYNK_CONNECTED() {
+  Serial.println("[BLYNK] Connected!");
+  Blynk.syncAll();
+  Blynk.sendInternal("rtc", "sync");
+}
+
+BLYNK_DISCONNECTED() {
+  Serial.println("[BLYNK] Disconnected!");
+}
+
+BLYNK_WRITE(InternalPinRTC) {
+  setTime(param.asLong());
+  Serial.println("[RTC] Time sync");
+}
+
+// ───────── SETUP ─────────
+void setup() {
+  Serial.begin(115200);
+
+  lcd.begin(16, 2);
+  lcd.setRGB(colorR, colorG, colorB);
+  lcd.print("Starting...");
+
+  myServo.attach(SERVO_PIN);
+  myServo.write(SERVO_CLOSED);
+
+  pinMode(buttonPin, INPUT_PULLUP);
+
+  connectWiFi();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("[BLYNK] Connecting...");
+    Blynk.config(BLYNK_AUTH_TOKEN);
+    Blynk.connect(5000);
+  }
+
+  timer.setInterval(2000L, updateDisplay);
+  timer.setInterval(1000L, updateTimeDisplay);
+  timer.setInterval(20L,   handleServo);
+  timer.setInterval(500L,  checkButton);
+  timer.setInterval(10000L, checkFeeding);
+}
+
+// ───────── LOOP ─────────
+void loop() {
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WiFi] Lost. Reconnecting...");
+    connectWiFi();
+
+    if (WiFi.status() == WL_CONNECTED) {
+      Blynk.config(BLYNK_AUTH_TOKEN);
+      Blynk.connect(5000);
+    }
+  }
+
+  Blynk.run();
+  timer.run();
+}
